@@ -4,7 +4,6 @@ A browser-based robot-arm grasping simulation that recreates a tabletop-clearing
 
 ## Live demo
 
-- Scripted fallback: https://sarahxugatech.github.io/mujoco-grasping-sim/
 - MuJoCo physics simulation: https://sarahxugatech.github.io/mujoco-grasping-sim/complex.html
 
 HTTPS hosting is recommended for reliable WebAssembly and ES-module loading.
