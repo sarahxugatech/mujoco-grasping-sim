@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MuJoCo Table Clearing</title>
+  <style>
+    /* Phase 1 shell: controls, status, and an empty rendering surface. */
+    :root { color-scheme: light; font-family: Inter, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { height: 100vh; margin: 0; overflow: hidden; display: grid; grid-template-rows: auto 1fr; background: #e6edf2; color: #17212a; }
+    header { min-height: 78px; padding: 11px 16px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; background: #fff; border-bottom: 1px solid #cbd6df; box-shadow: 0 2px 12px #354b5c12; }
+    h1 { margin: 0 10px 0 0; font-size: 18px; white-space: nowrap; }
+    button { min-width: 104px; min-height: 48px; padding: 14px 24px; border: 1px solid #9ba9b5; border-radius: 7px; background: white; font-size: 18px; line-height: 1; font-weight: 700; }
+    button:disabled { opacity: .42; }
+    #status { flex: 1 1 300px; min-width: 220px; margin-left: 8px; color: #365366; font-size: 13px; line-height: 1.35; }
+    #status.error { color: #a31d2c; font-weight: 700; }
+    #counter { margin-left: auto; font-weight: 800; white-space: nowrap; }
+    #view { display: block; width: 100%; height: 100%; min-height: 0; }
+  </style>
+</head>
+<body>
+  <!-- Controls are disabled until both WASM and the MJCF model are ready. -->
+  <header>
+    <h1>MuJoCo Table Clearing</h1>
+    <button id="start" disabled>Start</button>
+    <button id="step" disabled>Step</button>
+    <button id="reset" disabled>Reset</button>
+    <div id="status" role="status">Loading the official MuJoCo WASM module and Phase 2 MJCF…</div>
+    <div id="counter">Cleared 0 / 8 objects</div>
+  </header>
+  <canvas id="view"></canvas>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module">
+    // Phase 2 adds only the red cube to the already-verified WASM shell.
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+
+    const statusEl = document.querySelector('#status');
+    const canvas = document.querySelector('#view');
+    const startBtn = document.querySelector('#start');
+    const stepBtn = document.querySelector('#step');
+    const resetBtn = document.querySelector('#reset');
+    const counterEl = document.querySelector('#counter');
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.1;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x18344d);
+    scene.fog = new THREE.Fog(0x18344d, 4.8, 11.5);
+    const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 20);
+    camera.position.set(3.15, 2.05, -3.65);
+    const controls = new OrbitControls(camera, canvas);
+    controls.target.set(-0.28, 0.84, 0.05);
+    controls.enableDamping = true;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    scene.add(new THREE.HemisphereLight(0xc9dff0, 0x142536, 1.15));
+    const key = new THREE.DirectionalLight(0xf8fbff, 2.8);
+    key.position.set(3.8, 5.2, -4.5);
+    key.castShadow = true;
+    key.shadow.mapSize.set(2048, 2048);
+    key.shadow.radius = 3;
+    key.shadow.bias = -.0004;
+    key.shadow.camera.left = -3.5;
+    key.shadow.camera.right = 3.5;
+    key.shadow.camera.top = 3.5;
+    key.shadow.camera.bottom = -3.5;
+    scene.add(key);
+
+    // A procedural soft checker keeps the static page self-contained.
+    const floorCanvas = document.createElement('canvas');
+    floorCanvas.width = floorCanvas.height = 256;
+    const floorContext = floorCanvas.getContext('2d');
+    for (let y = 0; y < 8; y += 1) {
+      for (let x = 0; x < 8; x += 1) {
+        floorContext.fillStyle = (x + y) % 2 ? '#234b6b' : '#315d7f';
+        floorContext.fillRect(x * 32, y * 32, 32, 32);
+        floorContext.strokeStyle = '#8db6d0';
+        floorContext.lineWidth = 1;
+        floorContext.strokeRect(x * 32 + .5, y * 32 + .5, 31, 31);
+      }
+    }
+    const floorTexture = new THREE.CanvasTexture(floorCanvas);
+    floorTexture.wrapS = floorTexture.wrapT = THREE.RepeatWrapping;
+    floorTexture.repeat.set(5, 5);
+    floorTexture.colorSpace = THREE.SRGBColorSpace;
+    floorTexture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    const studioFloor = new THREE.Mesh(
+      new THREE.PlaneGeometry(12, 12),
+      new THREE.MeshStandardMaterial({ map: floorTexture, color: 0xffffff, metalness: .08, roughness: .72 })
+    );
+    studioFloor.rotation.x = -Math.PI / 2;
+    studioFloor.receiveShadow = true;
+    scene.add(studioFloor);
+
+    // MJCF baseline: fixed world, six hinged arm axes, symmetric slide fingers, one free cube.
+    const MJCF = `
+<mujoco model="table_clear_phase2">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.0025" gravity="0 0 -9.81" integrator="implicitfast" solver="Newton" cone="elliptic" impratio="10" iterations="20" ls_iterations="20"/>
+  <worldbody>
+    <geom name="table" type="box" pos="0 0 .66" size="1.8 1.2 .06" rgba=".96 .97 .98 1" friction=".8 .01 .0002"/>
+    <geom name="box_floor" type="box" pos="-.92 .68 .745" size=".31 .30 .025" rgba=".60 .34 .15 1" friction=".8 .01 .0002"/>
+    <geom name="box_back" type="box" pos="-.92 .985 .90" size=".33 .025 .18" rgba=".70 .43 .22 1"/>
+    <geom name="box_front" type="box" pos="-.92 .375 .90" size=".33 .025 .18" rgba=".70 .43 .22 1"/>
+    <geom name="box_left" type="box" pos="-1.245 .68 .90" size=".025 .28 .18" rgba=".70 .43 .22 1"/>
+    <geom name="box_right" type="box" pos="-.595 .68 .90" size=".025 .28 .18" rgba=".70 .43 .22 1"/>
+
+    <body name="base" pos="-1.2 -.45 .84">
+      <geom name="base_geom" type="cylinder" size=".20 .12" rgba=".72 .78 .82 1" mass="4" contype="0" conaffinity="0"/>
+      <body name="shoulder_yaw" pos="0 0 .18" gravcomp="1">
+        <joint name="j0" type="hinge" axis="0 0 1" range="-3.05 3.05" damping="4.2" armature=".08"/>
+        <geom name="shoulder_geom" type="sphere" size=".14" rgba=".52 .78 .90 1" mass="1.2" contype="0" conaffinity="0"/>
+        <body name="upper_arm" gravcomp="1">
+          <joint name="j1" type="hinge" axis="0 1 0" range="-2.8 2.8" damping="4.2" armature=".08"/>
+          <geom name="upper_geom" type="capsule" fromto="0 0 0 .68 0 0" size=".082" rgba=".56 .80 .91 1" mass="1.0" contype="0" conaffinity="0"/>
+          <body name="elbow" pos=".68 0 0" gravcomp="1">
+            <joint name="j2" type="hinge" axis="0 1 0" range="-2.8 2.8" damping="3" armature=".06"/>
+            <geom name="elbow_hub" type="sphere" size=".115" rgba=".73 .79 .83 1" mass=".35" contype="0" conaffinity="0"/>
+            <geom name="forearm_geom" type="capsule" fromto="0 0 0 .58 0 0" size=".072" rgba=".73 .79 .83 1" mass=".75" contype="0" conaffinity="0"/>
+            <body name="wrist_pitch" pos=".58 0 0" gravcomp="1">
+              <joint name="j3" type="hinge" axis="0 1 0" range="-3 3" damping="2" armature=".04"/>
+              <geom name="wrist_pitch_geom" type="sphere" size=".105" rgba=".52 .78 .90 1" mass=".20" contype="0" conaffinity="0"/>
+              <body name="wrist_roll" gravcomp="1">
+                <joint name="j4" type="hinge" axis="1 0 0" range="-3.1 3.1" damping="1.5" armature=".03"/>
+                <geom name="wrist_roll_geom" type="sphere" size=".088" rgba=".73 .79 .83 1" mass=".14" contype="0" conaffinity="0"/>
+                <body name="wrist_yaw" gravcomp="1">
+                  <joint name="j5" type="hinge" axis="0 0 1" range="-3.1 3.1" damping="1.2" armature=".025"/>
+                  <geom name="wrist_block" type="cylinder" pos="0 0 -.07" size=".105 .08" rgba=".08 .09 .11 1" mass=".12" contype="0" conaffinity="0"/>
+                  <body name="finger_left" pos="0 .115 -.08" gravcomp="1">
+                    <joint name="finger_left_slide" type="slide" axis="0 -1 0" range="0 .075" damping="1" armature=".002"/>
+                    <geom name="finger_left_pad" type="box" pos="0 0 -.14" size=".042 .025 .14" rgba=".04 .05 .06 1" mass=".035" friction="1.2 .015 .0002"/>
+                  </body>
+                  <body name="finger_right" pos="0 -.115 -.08" gravcomp="1">
+                    <joint name="finger_right_slide" type="slide" axis="0 1 0" range="0 .075" damping="1" armature=".002"/>
+                    <geom name="finger_right_pad" type="box" pos="0 0 -.14" size=".042 .025 .14" rgba=".04 .05 .06 1" mass=".035" friction="1.2 .015 .0002"/>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <body name="red_cube" pos="0 -.15 .79">
+      <freejoint name="red_cube_free"/>
+      <geom name="red_cube_geom" type="box" size=".055 .055 .055" rgba=".86 .12 .17 1" mass=".020" friction=".9 .01 .0002"/>
+    </body>
+    <body name="grey_bar" pos="-.28 .05 .75" quat=".9689 0 0 .2474">
+      <freejoint name="grey_bar_free"/>
+      <geom name="grey_bar_geom" type="box" size=".09 .035 .025" rgba=".36 .40 .43 1" mass=".015" friction=".9 .01 .0002"/>
+    </body>
+    <body name="purple_arch" pos="-.25 -.42 .72" quat=".9999 0 0 .015">
+      <freejoint name="purple_arch_free"/>
+      <geom name="purple_left" type="box" pos="0 .05 .055" size=".045 .025 .055" rgba=".50 .18 .72 1" mass=".007" friction=".9 .01 .0002"/>
+      <geom name="purple_right" type="box" pos="0 -.05 .055" size=".045 .025 .055" rgba=".50 .18 .72 1" mass=".007" friction=".9 .01 .0002"/>
+      <geom name="purple_bridge" type="box" pos="0 0 .13" size=".045 .075 .02" rgba=".50 .18 .72 1" mass=".011" friction=".9 .01 .0002"/>
+    </body>
+    <body name="blue_arch" pos="-.45 -.55 .72" quat=".998 0 0 -.067">
+      <freejoint name="blue_arch_free"/>
+      <geom name="blue_left" type="box" pos="0 .04 .055" size=".045 .025 .055" rgba=".12 .42 .86 1" mass=".007" friction=".9 .01 .0002"/>
+      <geom name="blue_right" type="box" pos="0 -.04 .055" size=".045 .025 .055" rgba=".12 .42 .86 1" mass=".007" friction=".9 .01 .0002"/>
+      <geom name="blue_bridge" type="box" pos="0 0 .13" size=".045 .065 .02" rgba=".12 .42 .86 1" mass=".011" friction=".9 .01 .0002"/>
+    </body>
+    <body name="red_block" pos="-.45 -.55 .905" quat=".998 0 0 -.067">
+      <freejoint name="red_block_free"/>
+      <geom name="red_block_geom" type="box" size=".055 .05 .03" rgba=".90 .18 .15 1" mass=".018" friction=".9 .01 .0002"/>
+    </body>
+    <body name="orange_cylinder" pos="-.45 -.55 .975">
+      <freejoint name="orange_cylinder_free"/>
+      <geom name="orange_cylinder_geom" type="cylinder" size=".04 .04" rgba="1 .43 .05 1" mass=".012" friction="1.4 .01 .0002"/>
+    </body>
+    <body name="black_pen" pos="-.15 -.72 .738" quat=".992 0 0 -.126">
+      <freejoint name="black_pen_free"/>
+      <geom name="black_pen_geom" type="box" size=".11 .018 .018" rgba=".03 .04 .05 1" mass=".010" friction=".9 .01 .0002"/>
+    </body>
+    <body name="tape_roll" pos="-.55 -.25 .745">
+      <freejoint name="tape_roll_free"/>
+      <geom name="tape_roll_geom" type="cylinder" size=".065 .025" rgba=".68 .88 .94 .55" mass=".020" friction=".9 .01 .0002"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="a0" joint="j0" kp="260" dampratio=".5" ctrlrange="-3.05 3.05" forcerange="-90 90"/>
+    <position name="a1" joint="j1" kp="260" dampratio=".5" ctrlrange="-2.8 2.8" forcerange="-90 90"/>
+    <position name="a2" joint="j2" kp="230" dampratio=".5" ctrlrange="-2.8 2.8" forcerange="-75 75"/>
+    <position name="a3" joint="j3" kp="160" dampratio=".5" ctrlrange="-3 3" forcerange="-45 45"/>
+    <position name="a4" joint="j4" kp="110" dampratio=".5" ctrlrange="-3.1 3.1" forcerange="-30 30"/>
+    <position name="a5" joint="j5" kp="110" dampratio=".5" ctrlrange="-3.1 3.1" forcerange="-30 30"/>
+    <position name="left_grip" joint="finger_left_slide" kp="180" ctrlrange="0 .075" forcerange="-12 12"/>
+    <position name="right_grip" joint="finger_right_slide" kp="180" ctrlrange="0 .075" forcerange="-12 12"/>
+  </actuator>
+</mujoco>`;
+
+    const materials = {
+      silver: new THREE.MeshStandardMaterial({ color: 0xe4e6e5, metalness: .20, roughness: .4 }),
+      blue: new THREE.MeshStandardMaterial({ color: 0xf2f2ef, metalness: .12, roughness: .44 }),
+      black: new THREE.MeshStandardMaterial({ color: 0x202326, metalness: .16, roughness: .66 }),
+      darkMetal: new THREE.MeshStandardMaterial({ color: 0x303438, metalness: .55, roughness: .34 }),
+      bolt: new THREE.MeshStandardMaterial({ color: 0xaeb5b9, metalness: .82, roughness: .24 }),
+      rubber: new THREE.MeshStandardMaterial({ color: 0x090a0b, metalness: 0, roughness: .92 }),
+      white: new THREE.MeshStandardMaterial({ color: 0xcbd3d6, roughness: .82 }),
+      brown: new THREE.MeshStandardMaterial({ color: 0x8b633f, roughness: .96 }),
+      red: new THREE.MeshStandardMaterial({ color: 0xa54b4b, roughness: .72 })
+    };
+    const physicsRoot = new THREE.Group();
+    physicsRoot.rotation.x = -Math.PI / 2;
+    scene.add(physicsRoot);
+    const bodyViews = [];
+
+    // Visuals are children of body groups; physics writes only group world poses.
+    function addMesh(group, geometry, material, position = [0, 0, 0], rotation = [0, 0, 0]) {
+      const item = new THREE.Mesh(geometry, material);
+      item.position.set(...position);
+      item.rotation.set(...rotation);
+      item.castShadow = true;
+      item.receiveShadow = true;
+      group.add(item);
+      return item;
+    }
+    function addBodyView(name, build) {
+      const group = new THREE.Group();
+      physicsRoot.add(group);
+      build(group);
+      bodyViews.push({ name, group, id: -1 });
+    }
+    function addWorldVisuals() {
+      addMesh(physicsRoot, new THREE.BoxGeometry(3.6, 2.4, .12), materials.white, [0, 0, .66]);
+      const legMaterial = new THREE.MeshStandardMaterial({ color: 0x555b5e, metalness: .48, roughness: .52 });
+      for (const x of [-1.55, 1.55]) {
+        for (const y of [-.95, .95]) addMesh(physicsRoot, new THREE.BoxGeometry(.12, .12, .60), legMaterial, [x, y, .30]);
+      }
+      addMesh(physicsRoot, new THREE.BoxGeometry(.62, .60, .05), materials.brown, [-.92, .68, .745]);
+      addMesh(physicsRoot, new THREE.BoxGeometry(.66, .05, .36), materials.brown, [-.92, .985, .90]);
+      addMesh(physicsRoot, new THREE.BoxGeometry(.66, .05, .36), materials.brown, [-.92, .375, .90]);
+      addMesh(physicsRoot, new THREE.BoxGeometry(.05, .56, .36), materials.brown, [-1.245, .68, .90]);
+      addMesh(physicsRoot, new THREE.BoxGeometry(.05, .56, .36), materials.brown, [-.595, .68, .90]);
+    }
+    function buildBodyVisuals() {
+      addWorldVisuals();
+      addBodyView('base', g => {
+        addMesh(g, new THREE.CylinderGeometry(.19, .22, .04, 36), materials.darkMetal, [0, 0, -.10], [Math.PI / 2, 0, 0]);
+        addMesh(g, new THREE.CylinderGeometry(.135, .18, .20, 36), materials.silver, [0, 0, .01], [Math.PI / 2, 0, 0]);
+        addMesh(g, new THREE.CylinderGeometry(.14, .14, .025, 36), materials.darkMetal, [0, 0, .11], [Math.PI / 2, 0, 0]);
+      });
+      addBodyView('shoulder_yaw', g => {
+        addMesh(g, new THREE.CylinderGeometry(.125, .14, .20, 32), materials.blue, [0, 0, 0], [Math.PI / 2, 0, 0]);
+        addMesh(g, new THREE.CylinderGeometry(.143, .143, .022, 32), materials.darkMetal, [0, 0, -.10], [Math.PI / 2, 0, 0]);
+      });
+      addBodyView('upper_arm', g => {
+        addMesh(g, new RoundedBoxGeometry(.22, .19, .20, 5, .045), materials.blue);
+        addMesh(g, new THREE.CylinderGeometry(.102, .102, .025, 32), materials.darkMetal, [0, -.108, 0]);
+        addMesh(g, new THREE.CylinderGeometry(.103, .103, .025, 32), materials.darkMetal, [0, .108, 0]);
+        addMesh(g, new THREE.CylinderGeometry(.035, .035, .028, 24), materials.bolt, [0, -.123, 0]);
+        addMesh(g, new RoundedBoxGeometry(.50, .145, .13, 5, .045), materials.blue, [.34, 0, 0]);
+      });
+      addBodyView('elbow', g => {
+        addMesh(g, new RoundedBoxGeometry(.19, .18, .19, 5, .045), materials.silver);
+        addMesh(g, new THREE.CylinderGeometry(.096, .096, .024, 30), materials.darkMetal, [0, -.102, 0]);
+        addMesh(g, new THREE.CylinderGeometry(.097, .097, .024, 30), materials.darkMetal, [0, .102, 0]);
+        addMesh(g, new THREE.CylinderGeometry(.032, .032, .027, 24), materials.bolt, [0, -.117, 0]);
+        addMesh(g, new RoundedBoxGeometry(.42, .13, .12, 5, .04), materials.silver, [.29, 0, 0]);
+      });
+      addBodyView('wrist_pitch', g => {
+        addMesh(g, new RoundedBoxGeometry(.17, .155, .17, 5, .04), materials.blue);
+        addMesh(g, new THREE.CylinderGeometry(.088, .088, .022, 30), materials.darkMetal, [0, -.089, 0]);
+        addMesh(g, new THREE.CylinderGeometry(.088, .088, .022, 30), materials.darkMetal, [0, .089, 0]);
+        addMesh(g, new THREE.CylinderGeometry(.027, .027, .025, 22), materials.bolt, [0, -.102, 0]);
+      });
+      addBodyView('wrist_roll', g => {
+        addMesh(g, new THREE.CylinderGeometry(.075, .082, .13, 28), materials.silver, [0, 0, 0], [0, 0, Math.PI / 2]);
+        addMesh(g, new THREE.CylinderGeometry(.084, .084, .022, 28), materials.darkMetal, [-.068, 0, 0], [0, 0, Math.PI / 2]);
+      });
+      addBodyView('wrist_yaw', g => {
+        addMesh(g, new THREE.CylinderGeometry(.09, .09, .07, 30), materials.silver, [0, 0, -.035], [Math.PI / 2, 0, 0]);
+        addMesh(g, new THREE.CylinderGeometry(.098, .098, .02, 30), materials.black, [0, 0, -.08], [Math.PI / 2, 0, 0]);
+        addMesh(g, new RoundedBoxGeometry(.21, .22, .075, 4, .025), materials.blue, [0, 0, -.125]);
+      });
+      addBodyView('finger_left', g => {
+        addMesh(g, new RoundedBoxGeometry(.07, .052, .095, 3, .014), materials.silver, [0, 0, -.05]);
+        addMesh(g, new RoundedBoxGeometry(.058, .041, .19, 3, .012), materials.blue, [0, 0, -.185]);
+        addMesh(g, new THREE.BoxGeometry(.068, .012, .13), materials.rubber, [0, -.028, -.20]);
+      });
+      addBodyView('finger_right', g => {
+        addMesh(g, new RoundedBoxGeometry(.07, .052, .095, 3, .014), materials.silver, [0, 0, -.05]);
+        addMesh(g, new RoundedBoxGeometry(.058, .041, .19, 3, .012), materials.blue, [0, 0, -.185]);
+        addMesh(g, new THREE.BoxGeometry(.068, .012, .13), materials.rubber, [0, .028, -.20]);
+      });
+      addBodyView('red_cube', g => addMesh(g, new THREE.BoxGeometry(.11, .11, .11), materials.red));
+      addBodyView('grey_bar', g => addMesh(g, new THREE.BoxGeometry(.18, .07, .05), new THREE.MeshStandardMaterial({ color: 0x62686b, roughness: .72 })));
+      addBodyView('purple_arch', g => {
+        const purple = new THREE.MeshStandardMaterial({ color: 0x745c80, roughness: .7 });
+        addMesh(g, new THREE.BoxGeometry(.09, .05, .11), purple, [0, .05, .055]);
+        addMesh(g, new THREE.BoxGeometry(.09, .05, .11), purple, [0, -.05, .055]);
+        addMesh(g, new THREE.BoxGeometry(.09, .15, .04), purple, [0, 0, .13]);
+      });
+      addBodyView('blue_arch', g => {
+        const blueBlock = new THREE.MeshStandardMaterial({ color: 0x496d82, roughness: .68 });
+        addMesh(g, new THREE.BoxGeometry(.09, .05, .11), blueBlock, [0, .04, .055]);
+        addMesh(g, new THREE.BoxGeometry(.09, .05, .11), blueBlock, [0, -.04, .055]);
+        addMesh(g, new THREE.BoxGeometry(.09, .13, .04), blueBlock, [0, 0, .13]);
+      });
+      addBodyView('red_block', g => addMesh(g, new THREE.BoxGeometry(.11, .10, .06), new THREE.MeshStandardMaterial({ color: 0xa84943, roughness: .7 })));
+      addBodyView('orange_cylinder', g => addMesh(g, new THREE.CylinderGeometry(.04, .04, .08, 22), new THREE.MeshStandardMaterial({ color: 0xb7773f, roughness: .66 }), [0, 0, 0], [Math.PI / 2, 0, 0]));
+      addBodyView('black_pen', g => addMesh(g, new THREE.BoxGeometry(.22, .036, .036), materials.black));
+      addBodyView('tape_roll', g => addMesh(g, new THREE.CylinderGeometry(.065, .065, .05, 28), new THREE.MeshStandardMaterial({ color: 0xb7cdd0, transparent: true, opacity: .56, roughness: .46 }), [0, 0, 0], [Math.PI / 2, 0, 0]));
+    }
+
+    let mujoco;
+    let model;
+    let data;
+    let modelReady = false;
+    let checked = false;
+    let poseStage = -1;
+    let poseStartedAt = 0;
+    let poseFrom = [];
+    const poseResults = [];
+    const POSE_TESTS = [
+      { name: 'extended', ctrl: [.25, -.35, .10, .25, .35, -.30, 0, 0], seconds: 1.25 },
+      { name: 'folded', ctrl: [.55, -1.15, 2.25, -1.10, -.40, .35, 0, 0], seconds: 1.55 },
+      { name: 'neutral', ctrl: [.30, -.70, 1.00, -.30, 0, 0, 0, 0], seconds: 1.25 }
+    ];
+    const HOME = POSE_TESTS[2].ctrl;
+    const OBJECTS = [
+      { name: 'red_cube', label: 'Red cube', grip: .075, reachZ: 1.35, lowerZ: 1.08, liftZ: 1.42 },
+      { name: 'grey_bar', label: 'Grey bar', grip: .075, reachZ: 1.32, lowerZ: 1.08, liftZ: 1.42 },
+      { name: 'purple_arch', label: 'Purple arch', grip: .075, reachZ: 1.35, lowerZ: 1.08, liftZ: 1.44 },
+      { name: 'orange_cylinder', label: 'Orange cylinder', grip: .075, reachZ: 1.42, lowerZ: 1.20, liftZ: 1.48, moveSeconds: 4.05 },
+      { name: 'red_block', label: 'Rear red block', grip: .075, reachZ: 1.38, lowerZ: 1.12, liftZ: 1.46 },
+      { name: 'blue_arch', label: 'Blue arch', grip: .075, reachZ: 1.35, lowerZ: 1.08, liftZ: 1.44 },
+      { name: 'black_pen', label: 'Black pen', grip: .075, reachZ: 1.31, lowerZ: 1.08, liftZ: 1.42 },
+      { name: 'tape_roll', label: 'Tape roll', grip: .040, reachZ: 1.34, lowerZ: 1.08, liftZ: 1.44 }
+    ];
+    const TASK_PHASES = [
+      { name: 'Approach', key: 'reach', seconds: 1.3 },
+      { name: 'Lower', key: 'lower', seconds: 1.0 },
+      { name: 'Close', key: 'close', seconds: 1.4 },
+      { name: 'Vertical Lift', key: 'lift', seconds: 1.1 },
+      { name: 'Move to Box', key: 'move', seconds: 3.15 },
+      { name: 'Release', key: 'release', seconds: 1.4 },
+      { name: 'Return', key: 'return', seconds: 1.3 }
+    ];
+    let taskReady = false;
+    let objectIndex = 0;
+    let taskPhaseIndex = 0;
+    let phaseActive = false;
+    let phaseStartedAt = 0;
+    let phaseFrom = [];
+    let phaseMid = [];
+    let phaseTo = [];
+    let autoRun = false;
+    let cleared = false;
+    let settleSample = null;
+    let maxSettleDrift = 0;
+    let maxMoveEndSpeed = 0;
+
+    // Engine/model failures are visible and never replaced with scripted motion.
+    try {
+      const { default: loadMujoco } = await import('https://cdn.jsdelivr.net/npm/@mujoco/mujoco@3.17.0/mujoco.js');
+      mujoco = await loadMujoco();
+      model = mujoco.MjModel.from_xml_string(MJCF);
+      data = new mujoco.MjData(model);
+      mujoco.mj_forward(model, data);
+      buildBodyVisuals();
+      for (const view of bodyViews) {
+        view.id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY.value, view.name);
+        if (view.id < 0) throw new Error(`MJCF body missing: ${view.name}`);
+      }
+      modelReady = true;
+      statusEl.textContent = 'MuJoCo and MJCF loaded; validating resting contact…';
+      window.simApp = { mujoco, model, data, bodyViews, MJCF };
+    } catch (error) {
+      console.error(error);
+      statusEl.classList.add('error');
+      statusEl.textContent = `MuJoCo/MJCF failed to load: ${error instanceof Error ? error.message : String(error)}`;
+      statusEl.dataset.wasm = 'failed';
+    }
+
+    function syncBodies() {
+      for (const { id, group } of bodyViews) {
+        const p = id * 3;
+        const q = id * 4;
+        group.position.set(data.xpos[p], data.xpos[p + 1], data.xpos[p + 2]);
+        group.quaternion.set(data.xquat[q + 1], data.xquat[q + 2], data.xquat[q + 3], data.xquat[q]);
+      }
+    }
+
+    // Phase 2 exit check uses measured MuJoCo positions after one second of settling.
+    function checkPhase2() {
+      const cube = bodyViews.find(v => v.name === 'red_cube');
+      const finite = bodyViews.every(v => Number.isFinite(data.xpos[v.id * 3 + 2]));
+      const cubeZ = data.xpos[cube.id * 3 + 2];
+      const resting = cubeZ >= .765 && cubeZ <= .80;
+      checked = true;
+      statusEl.dataset.model = finite && resting ? 'ready' : 'failed';
+      statusEl.classList.toggle('error', !(finite && resting));
+      statusEl.textContent = finite && resting
+        ? `Phase 2 PASS: red cube z=${cubeZ.toFixed(3)} m; starting the Phase 3 pose synchronization check…`
+        : `Phase 2 FAIL: finite=${finite}, red cube z=${cubeZ.toFixed(3)} m`;
+      if (finite && resting) startPoseStage(0);
+    }
+
+    function setControls(values) {
+      values.forEach((value, index) => { data.ctrl[index] = value; });
+    }
+
+    function bodyPosition(name) {
+      const view = bodyViews.find(item => item.name === name);
+      const p = view.id * 3;
+      return new THREE.Vector3(data.xpos[p], data.xpos[p + 1], data.xpos[p + 2]);
+    }
+
+    // Joint constraints guarantee the chain; measured separations catch sync/index mistakes.
+    function connectedChain() {
+      const expected = [
+        ['upper_arm', 'elbow', .68],
+        ['elbow', 'wrist_pitch', .58],
+        ['wrist_pitch', 'wrist_roll', 0],
+        ['wrist_roll', 'wrist_yaw', 0],
+        ['wrist_yaw', 'finger_left', Math.hypot(.115, .08)],
+        ['wrist_yaw', 'finger_right', Math.hypot(.115, .08)]
+      ];
+      return expected.every(([a, b, distance]) => Math.abs(bodyPosition(a).distanceTo(bodyPosition(b)) - distance) < .004);
+    }
+
+    function startPoseStage(index) {
+      poseStage = index;
+      poseStartedAt = Number(data.time);
+      poseFrom = Array.from(data.ctrl).slice(0, 8);
+      statusEl.textContent = `Phase 3: moving to the ${POSE_TESTS[index].name} pose (MuJoCo actuator)…`;
+    }
+
+    function updatePoseCheck() {
+      if (poseStage < 0 || poseStage >= POSE_TESTS.length) return;
+      const pose = POSE_TESTS[poseStage];
+      const elapsed = Number(data.time) - poseStartedAt;
+      const eased = minimumJerkEase(Math.min(1, elapsed / (pose.seconds * .75)));
+      pose.ctrl.forEach((target, index) => { data.ctrl[index] = THREE.MathUtils.lerp(poseFrom[index], target, eased); });
+      if (elapsed < pose.seconds) return;
+      setControls(pose.ctrl);
+      const maxError = Math.max(...pose.ctrl.slice(0, 6).map((target, index) => Math.abs(data.qpos[index] - target)));
+      const connected = connectedChain();
+      poseResults.push({ name: pose.name, maxError, connected });
+      if (poseStage + 1 < POSE_TESTS.length) {
+        startPoseStage(poseStage + 1);
+        return;
+      }
+      poseStage = POSE_TESTS.length;
+      const pass = poseResults.every(result => result.connected && result.maxError < .08);
+      const worst = Math.max(...poseResults.map(result => result.maxError));
+      statusEl.dataset.render = pass ? 'ready' : 'failed';
+      statusEl.classList.toggle('error', !pass);
+      statusEl.textContent = pass
+        ? `Phase 3 PASS: connected-chain maximum error ${worst.toFixed(3)} rad; Phase 4 single cube ready`
+        : `Phase 3 FAIL: ${poseResults.map(result => `${result.name} connected=${result.connected} error=${result.maxError.toFixed(3)}`).join('; ')}`;
+      if (pass) {
+        taskReady = true;
+        resetTask();
+        statusEl.textContent = `Phase 3 PASS: connected-chain maximum error ${worst.toFixed(3)} rad; eight-object task ready`;
+      }
+    }
+
+    // Analytic wrist targets become actuator commands; props are never moved here.
+    function armTarget(x, y, z, grip) {
+      const dx = x + 1.2;
+      const dy = y + .45;
+      const radial = Math.hypot(dx, dy);
+      const height = z - 1.02;
+      const l1 = .68;
+      const l2 = .58;
+      const c2 = THREE.MathUtils.clamp((radial * radial + height * height - l1 * l1 - l2 * l2) / (2 * l1 * l2), -1, 1);
+      const q2 = Math.acos(c2);
+      const q1 = Math.atan2(-height, radial) - Math.atan2(l2 * Math.sin(q2), l1 + l2 * Math.cos(q2));
+      return [Math.atan2(dy, dx), q1, q2, -(q1 + q2), 0, 0, grip, grip];
+    }
+
+    function currentObject() {
+      return OBJECTS[objectIndex];
+    }
+
+    function currentObjectPosition() {
+      return bodyPosition(currentObject().name);
+    }
+
+    function targetForPhase(key) {
+      const object = currentObject();
+      const position = currentObjectPosition();
+      const closed = object.grip;
+      if (key === 'reach') return armTarget(position.x, position.y, object.reachZ, 0);
+      if (key === 'lower') return armTarget(position.x, position.y, object.lowerZ, 0);
+      if (key === 'close') return [...Array.from(data.ctrl).slice(0, 6), closed, closed];
+      if (key === 'lift') return armTarget(position.x, position.y, object.liftZ, closed);
+      if (key === 'move') return armTarget(-.92, .68, 1.46, closed);
+      if (key === 'release') return [...Array.from(data.ctrl).slice(0, 6), 0, 0];
+      return armTarget(-.45, -.20, 1.48, 0);
+    }
+
+    // Minimum-jerk easing gives zero target velocity and acceleration at both ends.
+    function minimumJerkEase(value) {
+      const t = THREE.MathUtils.clamp(value, 0, 1);
+      return t * t * t * (10 + t * (-15 + 6 * t));
+    }
+
+    function beginTaskPhase() {
+      if (!taskReady || phaseActive || taskPhaseIndex >= TASK_PHASES.length) return;
+      const phase = TASK_PHASES[taskPhaseIndex];
+      phaseFrom = Array.from(data.ctrl).slice(0, 8);
+      phaseMid = phase.key === 'move'
+        ? armTarget(-.72, .42, 1.56, currentObject().grip)
+        : [];
+      phaseTo = targetForPhase(phase.key);
+      phaseStartedAt = Number(data.time);
+      if (phase.key === 'release') settleSample = null;
+      phaseActive = true;
+      statusEl.textContent = `${currentObject().label} · ${taskPhaseIndex + 1}/7: ${phase.name}`;
+      stepBtn.disabled = true;
+    }
+
+    function insideBox(position) {
+      return position.x > -1.22 && position.x < -.62 && position.y > .40 && position.y < .96 && position.z > .72 && position.z < 1.08;
+    }
+
+    // The counter follows the measured MuJoCo body position, not a task flag.
+    function measureCounter() {
+      const clearedCount = OBJECTS.filter(object => insideBox(bodyPosition(object.name))).length;
+      cleared = clearedCount === OBJECTS.length;
+      counterEl.textContent = `Cleared ${clearedCount} / ${OBJECTS.length} objects`;
+      return clearedCount;
+    }
+
+    function updateTask() {
+      if (!phaseActive) return;
+      const phase = TASK_PHASES[taskPhaseIndex];
+      const seconds = phase.key === 'move' && currentObject().moveSeconds ? currentObject().moveSeconds : phase.seconds;
+      const t = THREE.MathUtils.clamp((Number(data.time) - phaseStartedAt) / seconds, 0, 1);
+      const controlT = phase.key === 'reach' || phase.key === 'lower' || phase.key === 'close'
+        ? Math.min(1, t * 2)
+        : phase.key === 'release' ? Math.min(1, t / .28) : t;
+      if (phase.key === 'move') {
+        const motionT = Math.min(1, t / .89);
+        const eased = minimumJerkEase(motionT);
+        const inverse = 1 - eased;
+        phaseTo.forEach((target, index) => {
+          data.ctrl[index] = inverse ** 3 * phaseFrom[index]
+            + 3 * inverse ** 2 * eased * phaseMid[index]
+            + 3 * inverse * eased ** 2 * phaseMid[index]
+            + eased ** 3 * target;
+        });
+      } else {
+        const eased = minimumJerkEase(controlT);
+        phaseTo.forEach((target, index) => { data.ctrl[index] = THREE.MathUtils.lerp(phaseFrom[index], target, eased); });
+      }
+      if (phase.key === 'release' && t >= .85 && !settleSample) settleSample = currentObjectPosition().clone();
+      if (t < 1) return;
+      setControls(phaseTo);
+      phaseActive = false;
+      const settleDrift = phase.key === 'release' && settleSample ? settleSample.distanceTo(currentObjectPosition()) : 0;
+      if (phase.key === 'release') maxSettleDrift = Math.max(maxSettleDrift, settleDrift);
+      const moveEndSpeed = phase.key === 'move' ? Math.hypot(...Array.from(data.qvel).slice(0, 6)) : 0;
+      if (phase.key === 'move') maxMoveEndSpeed = Math.max(maxMoveEndSpeed, moveEndSpeed);
+      console.log('phase-complete', JSON.stringify({ object: currentObject().name, phase: phase.key, wrist: bodyPosition('wrist_yaw').toArray().map(v => Number(v.toFixed(3))), prop: currentObjectPosition().toArray().map(v => Number(v.toFixed(3))), settleDrift: Number(settleDrift.toFixed(4)), moveEndSpeed: Number(moveEndSpeed.toFixed(4)) }));
+      taskPhaseIndex += 1;
+      stepBtn.disabled = false;
+      if (taskPhaseIndex >= TASK_PHASES.length) {
+        const placed = insideBox(currentObjectPosition());
+        if (!placed) {
+          autoRun = false;
+          startBtn.disabled = false;
+          statusEl.classList.add('error');
+          statusEl.textContent = `FAIL: ${currentObject().label} position (${currentObjectPosition().toArray().map(v => v.toFixed(3)).join(', ')}) is outside the box`;
+          return;
+        }
+        objectIndex += 1;
+        measureCounter();
+        if (objectIndex >= OBJECTS.length) {
+          autoRun = false;
+          startBtn.disabled = false;
+          statusEl.classList.remove('error');
+          statusEl.textContent = `PASS: all ${OBJECTS.length} objects were grasped by contact friction and measured inside the box; maximum final displacement ${Math.round(maxSettleDrift * 1000)} mm`;
+          return;
+        }
+        taskPhaseIndex = 0;
+        if (autoRun) beginTaskPhase();
+        else statusEl.textContent = `${currentObject().label} ready; press Step to continue`;
+      } else if (autoRun) {
+        beginTaskPhase();
+      } else {
+        const wrist = bodyPosition('wrist_yaw');
+        const object = currentObjectPosition();
+        statusEl.textContent = `${phase.name} complete; wrist (${wrist.toArray().map(v => v.toFixed(2)).join(',')}), ${currentObject().label} (${object.toArray().map(v => v.toFixed(2)).join(',')})`;
+      }
+    }
+
+    function startTask() {
+      if (!taskReady || phaseActive || objectIndex >= OBJECTS.length || taskPhaseIndex >= TASK_PHASES.length) return;
+      autoRun = true;
+      startBtn.disabled = true;
+      beginTaskPhase();
+    }
+
+    function resetTask() {
+      if (!modelReady) return;
+      autoRun = false;
+      phaseActive = false;
+      taskPhaseIndex = 0;
+      objectIndex = 0;
+      cleared = false;
+      settleSample = null;
+      maxSettleDrift = 0;
+      maxMoveEndSpeed = 0;
+      mujoco.mj_resetData(model, data);
+      setControls(HOME);
+      mujoco.mj_forward(model, data);
+      syncBodies();
+      counterEl.textContent = `Cleared 0 / ${OBJECTS.length} objects`;
+      statusEl.classList.remove('error');
+      statusEl.textContent = `Reset complete: ${OBJECTS.length}-object clearing task ready`;
+      startBtn.disabled = false;
+      stepBtn.disabled = false;
+      resetBtn.disabled = false;
+    }
+
+    startBtn.onclick = startTask;
+    stepBtn.onclick = beginTaskPhase;
+    resetBtn.onclick = resetTask;
+
+    // Step exactly one display frame of physics, then render its state once.
+    function animate() {
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      if (canvas.width !== Math.round(width * renderer.getPixelRatio()) || canvas.height !== Math.round(height * renderer.getPixelRatio())) {
+        renderer.setSize(width, height, false);
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+      }
+      if (modelReady) {
+        const frameStart = Number(data.time);
+        while (Number(data.time) - frameStart < 1 / 60) mujoco.mj_step(model, data);
+        syncBodies();
+        if (!checked && Number(data.time) >= 1) checkPhase2();
+        if (checked) updatePoseCheck();
+        if (taskReady) {
+          updateTask();
+          measureCounter();
+        }
+      }
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>

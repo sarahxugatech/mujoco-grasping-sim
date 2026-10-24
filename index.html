@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Scripted Robot Arm Grasping Fallback</title>
+  <style>
+    /* Controls stay above the full-height Three.js view and wrap on narrow screens. */
+    :root { color-scheme: light; font-family: Inter, system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { height: 100vh; margin: 0; background: #eef2f6; color: #16202a; overflow: hidden; display: grid; grid-template-rows: auto 1fr; }
+    header { min-height: 86px; padding: 12px 18px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; background: #fff; border-bottom: 1px solid #ccd5df; }
+    h1 { margin: 0 16px 0 0; font-size: 18px; }
+    button { min-width: 104px; min-height: 48px; padding: 14px 24px; border: 1px solid #9aa9b8; border-radius: 7px; background: #fff; cursor: pointer; font-size: 18px; line-height: 1; font-weight: 650; }
+    button:hover { background: #eef5fb; }
+    button:disabled { opacity: .45; cursor: default; }
+    #counter { margin-left: auto; font-weight: 750; }
+    #status { color: #466071; font-size: 13px; min-width: 310px; }
+    #view { width: 100%; height: 100%; min-height: 0; display: block; }
+    .badge { padding: 4px 8px; border-radius: 999px; background: #fff1c2; color: #694d00; font-size: 12px; font-weight: 750; }
+  </style>
+</head>
+<body>
+  <!-- This page is explicitly the scripted fallback, not MuJoCo physics. -->
+  <header>
+    <h1>Table Clearing · Single Cube</h1>
+    <span class="badge">Scripted Animation</span>
+    <button id="start">Start</button>
+    <button id="step">Step</button>
+    <button id="reset">Reset</button>
+    <div id="status">Loading Three.js…</div>
+    <div id="counter">Cleared 0 / 1 objects</div>
+  </header>
+  <canvas id="view"></canvas>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module">
+    // Three.js and OrbitControls are the only runtime dependencies.
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    const canvas = document.querySelector('#view');
+    const statusEl = document.querySelector('#status');
+    const counterEl = document.querySelector('#counter');
+    const startBtn = document.querySelector('#start');
+    const stepBtn = document.querySelector('#step');
+    const resetBtn = document.querySelector('#reset');
+
+    // Scene dimensions are shared by animation and counter checks.
+    const TABLE_Y = 0.72;
+    const CUBE_HOME = new THREE.Vector3(0.32, TABLE_Y + 0.055, 0.28);
+    const BOX = { xMin: -1.32, xMax: -0.76, zMin: 0.48, zMax: 1.03, floorY: TABLE_Y + 0.04, rimY: TABLE_Y + 0.46 };
+    const PHASES = ['reach', 'lower', 'close', 'lift', 'move', 'release', 'return'];
+    const labels = { reach: 'Approach', lower: 'Lower', close: 'Close', lift: 'Vertical Lift', move: 'Move to Box', release: 'Release', return: 'Return' };
+    const targets = {
+      home: new THREE.Vector3(-0.10, 1.58, -0.05),
+      reach: new THREE.Vector3(CUBE_HOME.x, CUBE_HOME.y + 0.48, CUBE_HOME.z),
+      lower: new THREE.Vector3(CUBE_HOME.x, CUBE_HOME.y + 0.26, CUBE_HOME.z),
+      lift: new THREE.Vector3(CUBE_HOME.x, CUBE_HOME.y + 0.72, CUBE_HOME.z),
+      box: new THREE.Vector3(-1.04, 1.24, 0.74)
+    };
+
+    // Renderer, camera, and neutral studio lighting.
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0xdfe7ed);
+    scene.fog = new THREE.Fog(0xdfe7ed, 4.2, 8.5);
+    const camera = new THREE.PerspectiveCamera(42, 1, 0.01, 20);
+    camera.position.set(3.25, 2.75, 3.65);
+    const controls = new OrbitControls(camera, canvas);
+    controls.target.set(-0.15, 0.85, 0.25);
+    controls.enableDamping = true;
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x647382, 1.7));
+    const key = new THREE.DirectionalLight(0xffffff, 3.2);
+    key.position.set(2.5, 5, 3);
+    key.castShadow = true;
+    key.shadow.mapSize.set(2048, 2048);
+    scene.add(key);
+
+    // Small geometry helpers keep the robot construction readable.
+    const mat = (color, metalness = 0.1, roughness = 0.55) => new THREE.MeshStandardMaterial({ color, metalness, roughness });
+    const silver = mat(0xbfcbd4, 0.62, 0.3);
+    const blue = mat(0x91cfe8, 0.28, 0.38);
+    const black = mat(0x171b20, 0.68, 0.26);
+    const cardboard = mat(0xb97b42, 0, 0.85);
+    function mesh(geometry, material, parent, position = [0, 0, 0]) {
+      const item = new THREE.Mesh(geometry, material);
+      item.position.set(...position);
+      item.castShadow = true;
+      item.receiveShadow = true;
+      parent.add(item);
+      return item;
+    }
+    function link(parent, length, radius, material) {
+      const group = new THREE.Group();
+      parent.add(group);
+      mesh(new THREE.CylinderGeometry(radius, radius, length, 20), material, group, [0, length / 2, 0]);
+      const end = new THREE.Group();
+      end.position.y = length;
+      group.add(end);
+      return { group, end };
+    }
+
+    // Table and open box are simple fixed scene geometry.
+    mesh(new THREE.BoxGeometry(3.55, 0.12, 2.35), mat(0xf8fafb, 0, 0.78), scene, [0, TABLE_Y - 0.06, 0]);
+    mesh(new THREE.BoxGeometry(3.7, 0.68, 2.5), mat(0x56636d, 0, 0.8), scene, [0, 0.32, 0]);
+    const boxGroup = new THREE.Group();
+    scene.add(boxGroup);
+    const boxWallY = (BOX.floorY + BOX.rimY) / 2;
+    const boxWallH = BOX.rimY - BOX.floorY;
+    mesh(new THREE.BoxGeometry(0.62, 0.06, 0.62), cardboard, boxGroup, [-1.04, BOX.floorY, 0.76]);
+    mesh(new THREE.BoxGeometry(0.64, boxWallH, 0.035), cardboard, boxGroup, [-1.04, boxWallY, 0.45]);
+    mesh(new THREE.BoxGeometry(0.64, boxWallH, 0.035), cardboard, boxGroup, [-1.04, boxWallY, 1.07]);
+    mesh(new THREE.BoxGeometry(0.035, boxWallH, 0.59), cardboard, boxGroup, [-1.35, boxWallY, 0.76]);
+    mesh(new THREE.BoxGeometry(0.035, boxWallH, 0.59), cardboard, boxGroup, [-0.73, boxWallY, 0.76]);
+
+    // The robot is one parent-child chain: base → six joints → wrist → both claws.
+    const robot = new THREE.Group();
+    robot.position.set(-1.18, TABLE_Y, -0.28);
+    scene.add(robot);
+    mesh(new THREE.CylinderGeometry(0.20, 0.24, 0.18, 28), silver, robot, [0, 0.09, 0]);
+    const yaw = new THREE.Group();
+    yaw.position.y = 0.18;
+    robot.add(yaw);
+    mesh(new THREE.CylinderGeometry(0.16, 0.16, 0.16, 24), blue, yaw, [0, 0.08, 0]);
+    const shoulder = new THREE.Group();
+    shoulder.position.y = 0.16;
+    yaw.add(shoulder);
+    mesh(new THREE.SphereGeometry(0.15, 20, 14), silver, shoulder);
+    const upper = link(shoulder, 0.72, 0.09, blue);
+    const elbow = upper.end;
+    mesh(new THREE.SphereGeometry(0.13, 20, 14), silver, elbow);
+    const forearm = link(elbow, 0.62, 0.075, silver);
+    const wristPitch = forearm.end;
+    mesh(new THREE.SphereGeometry(0.11, 20, 14), blue, wristPitch);
+    const wristRoll = new THREE.Group();
+    wristPitch.add(wristRoll);
+    const wristYaw = new THREE.Group();
+    wristRoll.add(wristYaw);
+    const tool = new THREE.Group();
+    wristYaw.add(tool);
+    mesh(new THREE.CylinderGeometry(0.105, 0.105, 0.17, 22), black, tool, [0, -0.085, 0]);
+    const clawLeft = mesh(new THREE.BoxGeometry(0.055, 0.25, 0.075), black, tool, [-0.11, -0.245, 0]);
+    const clawRight = mesh(new THREE.BoxGeometry(0.055, 0.25, 0.075), black, tool, [0.11, -0.245, 0]);
+    const toolTip = new THREE.Object3D();
+    toolTip.position.y = -0.34;
+    tool.add(toolTip);
+
+    // The only prop is the fallback cube.
+    const cube = mesh(new THREE.BoxGeometry(0.11, 0.11, 0.11), mat(0xdc3944, 0.05, 0.48), scene);
+    cube.position.copy(CUBE_HOME);
+
+    // Analytic two-link aiming keeps every segment connected while placing the wrist.
+    function aimWrist(worldTarget) {
+      const shoulderWorld = new THREE.Vector3();
+      shoulder.getWorldPosition(shoulderWorld);
+      const dx = worldTarget.x - shoulderWorld.x;
+      const dz = worldTarget.z - shoulderWorld.z;
+      const r = Math.hypot(dx, dz);
+      const h = worldTarget.y - shoulderWorld.y;
+      const L1 = 0.72;
+      const L2 = 0.62;
+      const c2 = THREE.MathUtils.clamp((r * r + h * h - L1 * L1 - L2 * L2) / (2 * L1 * L2), -1, 1);
+      const q2 = -Math.acos(c2);
+      const a = Math.atan2(h, r) - Math.atan2(L2 * Math.sin(q2), L1 + L2 * Math.cos(q2));
+      yaw.rotation.y = Math.atan2(-dz, dx);
+      upper.group.rotation.z = a - Math.PI / 2;
+      forearm.group.rotation.z = q2;
+      wristPitch.rotation.z = -(upper.group.rotation.z + forearm.group.rotation.z);
+      wristRoll.rotation.y = 0;
+      wristYaw.rotation.z = 0;
+      scene.updateMatrixWorld(true);
+    }
+
+    let phaseIndex = 0;
+    let running = false;
+    let carrying = false;
+    let cleared = false;
+    let tween = null;
+    let releaseFall = null;
+    const transitionLog = [];
+    let liftStartY = null;
+
+    // Pose interpolation changes joint targets only; a carried cube is parented explicitly on this scripted page.
+    function wristPose(target, duration = 850) {
+      const start = currentTarget.clone();
+      const started = performance.now();
+      return new Promise(resolve => {
+        tween = now => {
+          const t = THREE.MathUtils.clamp((now - started) / duration, 0, 1);
+          const eased = t * t * (3 - 2 * t);
+          currentTarget.lerpVectors(start, target, eased);
+          aimWrist(currentTarget);
+          if (t >= 1) { tween = null; resolve(); }
+        };
+      });
+    }
+
+    function setClaws(openAmount) {
+      clawLeft.position.x = -openAmount;
+      clawRight.position.x = openAmount;
+    }
+
+    function attachCube() {
+      tool.attach(cube);
+      cube.position.set(0, -0.28, 0);
+      carrying = true;
+      liftStartY = new THREE.Vector3().setFromMatrixPosition(cube.matrixWorld).y;
+    }
+
+    function dropCube() {
+      scene.attach(cube);
+      carrying = false;
+      const start = cube.position.clone();
+      const end = new THREE.Vector3(-1.04, BOX.floorY + 0.085, 0.76);
+      const started = performance.now();
+      releaseFall = now => {
+        const t = THREE.MathUtils.clamp((now - started) / 620, 0, 1);
+        cube.position.lerpVectors(start, end, t * t);
+        cube.rotation.z += 0.025;
+        if (t >= 1) releaseFall = null;
+      };
+    }
+
+    // Each Step runs exactly one named task phase.
+    async function runPhase() {
+      if (phaseIndex >= PHASES.length) return;
+      const phase = PHASES[phaseIndex];
+      transitionLog.push(phase);
+      statusEl.textContent = `Phase ${phaseIndex + 1}/7: ${labels[phase]}`;
+      stepBtn.disabled = true;
+      if (phase === 'reach') await wristPose(targets.reach);
+      if (phase === 'lower') await wristPose(targets.lower, 650);
+      if (phase === 'close') { setClaws(0.065); attachCube(); await wait(420); }
+      if (phase === 'lift') await wristPose(targets.lift, 900);
+      if (phase === 'move') await wristPose(targets.box, 1150);
+      if (phase === 'release') { setClaws(0.11); dropCube(); await wait(720); measureCounter(); }
+      if (phase === 'return') await wristPose(targets.home, 950);
+      phaseIndex += 1;
+      stepBtn.disabled = false;
+      if (phaseIndex === PHASES.length) finishRun();
+    }
+
+    function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+    // Success comes from the cube's measured world position inside the box.
+    function measureCounter() {
+      const p = new THREE.Vector3();
+      cube.getWorldPosition(p);
+      if (!cleared && p.x > BOX.xMin && p.x < BOX.xMax && p.z > BOX.zMin && p.z < BOX.zMax && p.y < BOX.rimY) cleared = true;
+      counterEl.textContent = `Cleared ${cleared ? 1 : 0} / 1 objects`;
+    }
+
+    function finishRun() {
+      running = false;
+      startBtn.disabled = false;
+      const p = new THREE.Vector3();
+      cube.getWorldPosition(p);
+      const orderOK = transitionLog.join(',') === PHASES.join(',');
+      const liftOK = liftStartY !== null && p.y !== liftStartY;
+      const pass = orderOK && liftOK && cleared && !carrying;
+      statusEl.textContent = `${pass ? 'Self-test PASS' : 'Self-test FAIL'}: sequence ${orderOK ? '✓' : '✗'}, lift ${liftOK ? '✓' : '✗'}, inside box ${cleared ? '✓' : '✗'}`;
+    }
+
+    async function runAll() {
+      if (running || phaseIndex >= PHASES.length) return;
+      running = true;
+      startBtn.disabled = true;
+      while (running && phaseIndex < PHASES.length) await runPhase();
+    }
+
+    // Reset restores both transforms and the finite-state controller.
+    function reset() {
+      running = false;
+      tween = null;
+      releaseFall = null;
+      phaseIndex = 0;
+      transitionLog.length = 0;
+      carrying = false;
+      cleared = false;
+      liftStartY = null;
+      scene.attach(cube);
+      cube.position.copy(CUBE_HOME);
+      cube.rotation.set(0, 0, 0);
+      setClaws(0.11);
+      currentTarget.copy(targets.home);
+      aimWrist(currentTarget);
+      counterEl.textContent = 'Cleared 0 / 1 objects';
+      statusEl.textContent = 'Ready: press Start to run automatically, or Step to advance one phase';
+      startBtn.disabled = false;
+      stepBtn.disabled = false;
+    }
+
+    startBtn.addEventListener('click', runAll);
+    stepBtn.addEventListener('click', () => { if (!running) runPhase(); });
+    resetBtn.addEventListener('click', reset);
+
+    // Resize and render continuously; only the scripted controller writes prop poses.
+    const currentTarget = targets.home.clone();
+    function resize() {
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      if (canvas.width !== Math.round(width * renderer.getPixelRatio()) || canvas.height !== Math.round(height * renderer.getPixelRatio())) {
+        renderer.setSize(width, height, false);
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+      }
+    }
+    function animate(now) {
+      resize();
+      if (tween) tween(now);
+      if (releaseFall) releaseFall(now);
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    reset();
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>
